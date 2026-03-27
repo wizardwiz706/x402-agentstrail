@@ -1,0 +1,21 @@
+{
+  "name": "x402-facilitator-svm",
+  "version": "1.0.0",
+  "description": "Self-hosted x402 facilitator for Solana devnet",
+  "type": "module",
+  "main": "facilitator.js",
+  "scripts": {
+    "start": "node facilitator.js"
+  },
+  "dependencies": {
+    "@x402/core": "latest",
+    "@x402/svm": "latest",
+    "@solana/kit": "latest",
+    "express": "^4.19.2",
+    "express-rate-limit": "^7.5.0",
+    "helmet": "^8.0.0",
+    "cors": "^2.8.5",
+    "@solana/web3.js": "^1.95.4",
+    "dotenv": "^16.4.5"
+  }
+}
