@@ -24,16 +24,30 @@ import { toFacilitatorSvmSigner } from "@x402/svm";
 import { VersionedTransaction, Connection, PublicKey, LAMPORTS_PER_SOL } from "@solana/web3.js";
 
 const PORT              = process.env.PORT              || 4402;
-const NETWORK           = process.env.NETWORK           || "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1";
-const SOLANA_RPC_URL    = process.env.SOLANA_RPC_URL    || "https://api.devnet.solana.com";
 const KEYPAIR_PATH      = process.env.FACILITATOR_KEYPAIR_PATH;
 const CORS_ORIGIN       = process.env.CORS_ORIGIN       || "*";
 
+// ── Network config ────────────────────────────────────────────────────────────
+const NETWORK_DEVNET  = "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1";
+const NETWORK_MAINNET = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp";
+
+const RPC_DEVNET  = process.env.SOLANA_RPC_URL_DEVNET  || process.env.SOLANA_RPC_URL || "https://api.devnet.solana.com";
+const RPC_MAINNET = process.env.SOLANA_RPC_URL_MAINNET || "";
+
+// Which networks to enable (at least devnet; mainnet if RPC is provided)
+const ENABLED_NETWORKS = [NETWORK_DEVNET];
+if (RPC_MAINNET) ENABLED_NETWORKS.push(NETWORK_MAINNET);
+
+// Primary RPC for health checks (prefer mainnet if enabled)
+const PRIMARY_RPC = RPC_MAINNET || RPC_DEVNET;
+
 // ── Load facilitator keypair ──────────────────────────────────────────────────
-// Three methods (in priority order):
+// Four methods (in priority order):
 //   1. FACILITATOR_KEYPAIR_ENCRYPTED + KEYPAIR_PASSPHRASE — AES-256-GCM encrypted (most secure)
-//   2. FACILITATOR_KEYPAIR_JSON — raw JSON array in env var (for Coolify/Railway)
-//   3. FACILITATOR_KEYPAIR_PATH — path to JSON file on disk (local dev only)
+//   2. SOLANA_PRIVATE_KEY_BYTES — comma-separated byte values (e.g. "100,198,139,...")
+//   3. FACILITATOR_KEYPAIR_JSON — raw JSON array in env var (e.g. "[100,198,139,...]")
+//   4. FACILITATOR_KEYPAIR_PATH — path to JSON file on disk (local dev only)
+const KEYPAIR_BYTES     = process.env.SOLANA_PRIVATE_KEY_BYTES;
 const KEYPAIR_JSON      = process.env.FACILITATOR_KEYPAIR_JSON;
 const KEYPAIR_ENCRYPTED = process.env.FACILITATOR_KEYPAIR_ENCRYPTED;
 const KEYPAIR_PASS      = process.env.KEYPAIR_PASSPHRASE;
@@ -51,6 +65,9 @@ if (KEYPAIR_ENCRYPTED && KEYPAIR_PASS) {
   dec.setAuthTag(tag);
   rawKeypair = JSON.parse(Buffer.concat([dec.update(enc), dec.final()]).toString());
   console.log("Keypair loaded from encrypted env var");
+} else if (KEYPAIR_BYTES) {
+  rawKeypair = KEYPAIR_BYTES.split(",").map(b => parseInt(b.trim(), 10));
+  console.log("Keypair loaded from SOLANA_PRIVATE_KEY_BYTES env var");
 } else if (KEYPAIR_JSON) {
   rawKeypair = JSON.parse(KEYPAIR_JSON);
   console.log("Keypair loaded from FACILITATOR_KEYPAIR_JSON env var");
@@ -60,19 +77,30 @@ if (KEYPAIR_ENCRYPTED && KEYPAIR_PASS) {
 } else {
   console.error("No keypair configured. Set one of:");
   console.error("  FACILITATOR_KEYPAIR_ENCRYPTED + KEYPAIR_PASSPHRASE");
-  console.error("  FACILITATOR_KEYPAIR_JSON");
-  console.error("  FACILITATOR_KEYPAIR_PATH");
+  console.error("  SOLANA_PRIVATE_KEY_BYTES=100,198,139,...");
+  console.error("  FACILITATOR_KEYPAIR_JSON=[100,198,139,...]");
+  console.error("  FACILITATOR_KEYPAIR_PATH=/path/to/keypair.json");
   process.exit(1);
 }
 const keypair      = await createKeyPairSignerFromBytes(Uint8Array.from(rawKeypair));
 const FEE_PAYER_PK = new PublicKey(keypair.address);
-const connection   = new Connection(SOLANA_RPC_URL, "confirmed");
+const connection   = new Connection(PRIMARY_RPC, "confirmed");
 console.log("Facilitator fee payer :", keypair.address);
 
-// ── Build the x402 facilitator ───────────────────────────────────────────────
-const svmSigner   = toFacilitatorSvmSigner(keypair, { defaultRpcUrl: SOLANA_RPC_URL });
-const svmScheme   = new ExactSvmScheme(svmSigner);
-const facilitator = new x402Facilitator().register(NETWORK, svmScheme);
+// ── Build the x402 facilitator (register each enabled network) ───────────────
+const facilitator = new x402Facilitator();
+
+// Devnet — always registered
+const devnetSigner = toFacilitatorSvmSigner(keypair, { defaultRpcUrl: RPC_DEVNET });
+facilitator.register(NETWORK_DEVNET, new ExactSvmScheme(devnetSigner));
+console.log(`  Registered: ${NETWORK_DEVNET} → ${RPC_DEVNET.split('?')[0]}...`);
+
+// Mainnet — only if RPC is provided
+if (RPC_MAINNET) {
+  const mainnetSigner = toFacilitatorSvmSigner(keypair, { defaultRpcUrl: RPC_MAINNET });
+  facilitator.register(NETWORK_MAINNET, new ExactSvmScheme(mainnetSigner));
+  console.log(`  Registered: ${NETWORK_MAINNET} → ${RPC_MAINNET.split('?')[0]}...`);
+}
 
 // ── Sponsor Policy ────────────────────────────────────────────────────────────
 // Allowed USDC mints (devnet + mainnet). Override via ALLOWED_ASSETS env var.
@@ -89,7 +117,7 @@ const ALLOWED_ASSETS = new Set(
 const ALLOWED_NETWORKS = new Set(
   process.env.ALLOWED_NETWORKS
     ? process.env.ALLOWED_NETWORKS.split(",").map(s => s.trim())
-    : [NETWORK]
+    : ENABLED_NETWORKS
 );
 
 // Optional payTo allowlist — if set, only these recipient addresses are permitted.
@@ -267,7 +295,7 @@ app.get("/health", async (_req, res) => {
       feePayerAddress: keypair.address,
       feePayerBalance: `${solBalance.toFixed(4)} SOL`,
       lowBalance,
-      network:         NETWORK,
+      networks:        ENABLED_NETWORKS,
       timestamp:       new Date().toISOString(),
     });
   } catch (err) {
@@ -314,8 +342,9 @@ app.post("/settle", settleLimiter, txInspectionMiddleware, async (req, res) => {
 // ── Start ─────────────────────────────────────────────────────────────────────
 const server = app.listen(PORT, async () => {
   console.log(`\nx402 Facilitator (Solana) → http://localhost:${PORT}`);
-  console.log(`  Network   : ${NETWORK}`);
-  console.log(`  RPC       : ${SOLANA_RPC_URL}`);
+  console.log(`  Networks  : ${ENABLED_NETWORKS.join(", ")}`);
+  if (RPC_DEVNET)  console.log(`  RPC (dev) : ${RPC_DEVNET.split('?')[0]}...`);
+  if (RPC_MAINNET) console.log(`  RPC (main): ${RPC_MAINNET.split('?')[0]}...`);
   console.log(`  Endpoints : GET /supported  POST /verify  POST /settle  GET /health\n`);
   try {
     const lamports = await connection.getBalance(FEE_PAYER_PK);
