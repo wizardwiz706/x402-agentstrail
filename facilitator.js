@@ -16,6 +16,7 @@ import helmet from "helmet";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
 import { readFileSync } from "fs";
+import { createDecipheriv, scryptSync } from "crypto";
 import { createKeyPairSignerFromBytes } from "@solana/kit";
 import { x402Facilitator } from "@x402/core/facilitator";
 import { ExactSvmScheme } from "@x402/svm/exact/facilitator";
@@ -29,11 +30,40 @@ const KEYPAIR_PATH      = process.env.FACILITATOR_KEYPAIR_PATH;
 const CORS_ORIGIN       = process.env.CORS_ORIGIN       || "*";
 
 // ── Load facilitator keypair ──────────────────────────────────────────────────
-if (!KEYPAIR_PATH) {
-  console.error("FACILITATOR_KEYPAIR_PATH must be set in .env");
+// Three methods (in priority order):
+//   1. FACILITATOR_KEYPAIR_ENCRYPTED + KEYPAIR_PASSPHRASE — AES-256-GCM encrypted (most secure)
+//   2. FACILITATOR_KEYPAIR_JSON — raw JSON array in env var (for Coolify/Railway)
+//   3. FACILITATOR_KEYPAIR_PATH — path to JSON file on disk (local dev only)
+const KEYPAIR_JSON      = process.env.FACILITATOR_KEYPAIR_JSON;
+const KEYPAIR_ENCRYPTED = process.env.FACILITATOR_KEYPAIR_ENCRYPTED;
+const KEYPAIR_PASS      = process.env.KEYPAIR_PASSPHRASE;
+
+let rawKeypair;
+if (KEYPAIR_ENCRYPTED && KEYPAIR_PASS) {
+  // Decrypt: base64 blob = salt(32) + iv(12) + authTag(16) + ciphertext
+  const buf  = Buffer.from(KEYPAIR_ENCRYPTED, "base64");
+  const salt = buf.subarray(0, 32);
+  const iv   = buf.subarray(32, 44);
+  const tag  = buf.subarray(44, 60);
+  const enc  = buf.subarray(60);
+  const key  = scryptSync(KEYPAIR_PASS, salt, 32);
+  const dec  = createDecipheriv("aes-256-gcm", key, iv);
+  dec.setAuthTag(tag);
+  rawKeypair = JSON.parse(Buffer.concat([dec.update(enc), dec.final()]).toString());
+  console.log("Keypair loaded from encrypted env var");
+} else if (KEYPAIR_JSON) {
+  rawKeypair = JSON.parse(KEYPAIR_JSON);
+  console.log("Keypair loaded from FACILITATOR_KEYPAIR_JSON env var");
+} else if (KEYPAIR_PATH) {
+  rawKeypair = JSON.parse(readFileSync(KEYPAIR_PATH, "utf-8"));
+  console.log("Keypair loaded from file:", KEYPAIR_PATH);
+} else {
+  console.error("No keypair configured. Set one of:");
+  console.error("  FACILITATOR_KEYPAIR_ENCRYPTED + KEYPAIR_PASSPHRASE");
+  console.error("  FACILITATOR_KEYPAIR_JSON");
+  console.error("  FACILITATOR_KEYPAIR_PATH");
   process.exit(1);
 }
-const rawKeypair   = JSON.parse(readFileSync(KEYPAIR_PATH, "utf-8"));
 const keypair      = await createKeyPairSignerFromBytes(Uint8Array.from(rawKeypair));
 const FEE_PAYER_PK = new PublicKey(keypair.address);
 const connection   = new Connection(SOLANA_RPC_URL, "confirmed");
@@ -89,6 +119,7 @@ const TX_ALLOWED_PROGRAMS = new Set([
 const MAX_CU           = parseInt(process.env.MAX_COMPUTE_UNITS             ?? "200000", 10);
 const MAX_PRIORITY_FEE = BigInt(process.env.MAX_PRIORITY_FEE_MICROLAMPORTS  ?? "50000");
 const LOW_SOL_WARN     = parseFloat(process.env.LOW_BALANCE_THRESHOLD_SOL   ?? "0.05");
+const ALERT_WEBHOOK    = process.env.ALERT_WEBHOOK_URL;  // Discord/Slack webhook for low-balance alerts
 
 /** Returns a policy error string on violation, or null if all checks pass. */
 function inspectTransaction(paymentPayload) {
@@ -290,11 +321,31 @@ const server = app.listen(PORT, async () => {
     const lamports = await connection.getBalance(FEE_PAYER_PK);
     const sol = lamports / LAMPORTS_PER_SOL;
     console.log(`  Fee payer balance: ${sol.toFixed(4)} SOL`);
-    if (sol < LOW_SOL_WARN) console.warn(`  ⚠  LOW BALANCE — top up fee payer with SOL\n`);
+    if (sol < LOW_SOL_WARN) {
+      console.warn(`  ⚠  LOW BALANCE — top up fee payer with SOL\n`);
+      sendBalanceAlert(sol);
+    }
   } catch (e) {
     console.warn("  ⚠  Could not fetch fee payer balance:", e.message);
   }
 });
+
+// ── Low-balance alert ─────────────────────────────────────────────────────────
+let lastAlertTime = 0;
+async function sendBalanceAlert(solBalance) {
+  if (!ALERT_WEBHOOK) return;
+  if (Date.now() - lastAlertTime < 600_000) return; // max 1 alert per 10 min
+  lastAlertTime = Date.now();
+  try {
+    await fetch(ALERT_WEBHOOK, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        content: `⚠️ **x402 Facilitator Low Balance**\nFee payer \`${keypair.address}\` has **${solBalance.toFixed(4)} SOL** remaining (threshold: ${LOW_SOL_WARN} SOL).\nTop up immediately to avoid failed settlements.`,
+      }),
+    });
+  } catch (e) { console.warn("Failed to send alert:", e.message); }
+}
 
 function gracefulShutdown(signal) {
   console.log(`\n[${signal}] Shutting down...`);
